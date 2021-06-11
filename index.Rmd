@@ -1,0 +1,170 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Martin Watts"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(cache = TRUE)
+
+library(dplyr)
+library(caret)
+library(parallel)
+library(doParallel)
+```
+
+```{r data, include=FALSE}
+training = read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv") %>%
+  as_tibble() %>%
+  mutate(classe = as.factor(classe))
+quizSet = read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv") %>%
+  as_tibble()
+
+################################################################################
+#####     Clean the data
+unnecessaryVars = c('X', 'user_name', 'raw_timestamp_part_1', 'raw_timestamp_part_2',
+                    'cvtd_timestamp', 'num_window', 'new_window')
+
+trainingClean = training %>%
+  # Kurtosis and skewness are character, should be a number
+  mutate(
+    across(c(starts_with('kurtosis_'), starts_with('skewness_'),
+             max_yaw_belt, min_yaw_belt, amplitude_yaw_belt,
+             max_yaw_dumbbell, min_yaw_dumbbell, amplitude_yaw_dumbbell,
+             max_yaw_forearm, min_yaw_forearm, amplitude_yaw_forearm),
+           ~suppressWarnings(as.numeric(.)))
+  )
+nearZeroVars = nearZeroVar(trainingClean)
+NACols = trainingClean %>%
+  summarise(across(.fns = ~any(is.na(.)))) %>%
+  tidyr::pivot_longer(cols = everything(), values_to = 'hasNA') %>%
+  filter(hasNA) %>%
+  pull(name)
+
+trainingClean = trainingClean %>%
+  select(-any_of(c(NACols, nearZeroVars, unnecessaryVars)))
+```
+
+## Summary
+
+Models were trained to predict the classification of movement of Unilateral Dumbell Curls given various gyrascopic data. The most successful model found was an ensemble model based on primarly Random Forest and Gradient Boosted Machine models and marginally by a Linear Discriminant Analysis model. The estimated out-of-bag error rate for this model was 0.47%.
+
+## Brief
+
+Data was collected ([source]("http://groupware.les.inf.puc-rio.br/har")) from accelerometers on the belt, forearm, arm and dumbell for 6 participants while performing Unilateral Dumbell Curls in five manners: one correctly and 4 given deviations from the specificaiton. Train a model to classify if a movement is being performed correctly or incorrectly.
+
+This report will describe how the model was built, how cross validation was used, an estimate of the expected out of sample error, and why choices were made.
+
+## The data
+
+The data consists of 19,622 observations of 160 variables including the manner of exercise `classe` (the outcome), the participant, timestamps of measurement, an identifier for the instance of exercise `num_window` and gyrascopic information from each of the accelerometers: roll/pitch/yaw etc.
+
+The data was cleaned down to 53 variables to be used in the models, as:
+
+* Variables with any NA values were removed
+* Variables with near zero variance were removed
+* (Several character variables were also cast to numeric but these were removed by the above)
+
+
+## The models
+
+75% of the data was used in a training set, using stratified sampling on `classe`. The remaining 25% was used as a test set to calculate an ensemble model.
+
+Models were trained on the training set using Linear Discriminant Analysis, Gradient Boosted Machine and Random Forest. These 3 models were then stacked together using another Random Forest model from their predictions on the test set. Some summary information from the models is given below. 
+
+```{r ldaModel}
+set.seed(123)
+trainIdx = createDataPartition(trainingClean$classe, list = FALSE, p = 0.75)
+trainDF = trainingClean[trainIdx, ]
+testDF = trainingClean[-trainIdx, ]
+
+cluster = makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+fitControl = trainControl(
+  method = "cv",
+  number = 5,
+  allowParallel = TRUE
+)
+
+modList = list()
+modList$lda = train(classe ~ ., data = trainDF, method = 'lda', trControl = fitControl)
+```
+
+```{r gmbModel}
+modList$gbm = train(classe ~ ., data = trainDF, method = 'gbm', trControl = fitControl,
+                    verbose = FALSE)
+```
+
+```{r rfModel}
+modList$rf = train(classe ~ ., data = trainDF, method = 'rf', trControl = fitControl)
+stopCluster(cluster)
+```
+
+```{r stack}
+#saveRDS(modList, 'modList.RDS')
+
+testDF$pred_lda = predict(modList$lda, newdata = testDF)
+testDF$pred_gbm = predict(modList$gbm, newdata = testDF)
+testDF$pred_rf = predict(modList$rf, newdata = testDF)
+
+# Then look at ensemble
+stackDF = testDF %>%
+  select(classe, starts_with('pred_'))
+modList$stack = train(classe ~ ., data = stackDF, method = 'rf', trControl = fitControl)
+
+if (FALSE) {
+  testDF$pred_stack = modList$stack$finalModel$predicted
+  testDF %>%
+    summarise(
+      m1Acc = mean(classe == pred_lda),
+      m2Acc = mean(classe == pred_gbm),
+      m3Acc = mean(classe == pred_rf),
+      mStackAcc = mean(classe == pred_stack),
+    )
+}
+```
+
+**Linear Discriminant Analysis on training set**
+
+```{r}
+confusionMatrix.train(modList$lda)
+```
+
+**Gradient Boosted Machine on training set**
+
+```{r}
+confusionMatrix.train(modList$gbm)
+```
+
+**Random Forest on training set**
+
+```{r}
+confusionMatrix.train(modList$rf)
+```
+
+**Stacked model on test set**
+
+```{r}
+confusionMatrix.train(modList$stack)
+modList$stack$finalModel
+```
+
+The best performing model was the stacked model, with an OOB estimate of error rate of `r round(modList$stack$finalModel$err.rate[[modList$stack$finalModel$ntree, "OOB"]], 4) * 100`%.
+
+Individually, the random forest model slightly outperformed the gradient boosted machine model and both greatly outperformed the linear discriminant analysis model. The LDA model may have benefitted from further data cleaning such as transformation of variables, but as the other models performed so well this isn't necessary.
+
+## Predictions on 20 hold-out rows - all correct
+
+```{r quiz}
+quizClean = quizSet %>%
+  select(X, colnames(select(trainingClean, -classe)))
+quizClean$pred_lda = predict(modList$lda, newdata = quizClean)
+quizClean$pred_gbm = predict(modList$gbm, newdata = quizClean)
+quizClean$pred_rf = predict(modList$rf, newdata = quizClean)
+quizClean$pred = predict(modList$stack, newdata = quizClean)
+
+quizClean %>%
+  select(X, pred)
+```
